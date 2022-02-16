@@ -27,6 +27,12 @@ typedef enum {
 	GeneralCaptureApplicationStream = 2,
 } GeneralCaptureStreamType;
 
+@interface GeneralCaptureDelegate : NSObject <SCStreamOutput>
+
+@property struct general_capture *dc;
+
+@end
+
 struct general_capture {
 	obs_source_t *source;
 
@@ -40,6 +46,7 @@ struct general_capture {
 
 	SCStream *disp;
 	SCShareableContent *shareable_content;
+	GeneralCaptureDelegate *capture_delegate;
 
 	os_event_t *disp_finished;
 	os_event_t *stream_start_completed;
@@ -54,14 +61,17 @@ struct general_capture {
 	NSString *application_id;
 };
 
-static void destroy_display_stream(struct general_capture *dc)
+static void destroy_general_stream(struct general_capture *dc)
 {
 	if (dc->disp) {
-		[dc->disp
-			stopWithCompletionHandler:^(NSError *_Nullable error) {
-				UNUSED_PARAMETER(error);
-				os_event_signal(dc->disp_finished);
-			}];
+		[dc->disp stopCaptureWithCompletionHandler:^(
+				  NSError *_Nullable error) {
+			blog(LOG_ERROR,
+			     "destroy_general_stream: Failed to stop stream with error %s\n",
+			     [[error localizedFailureReason]
+				     cStringUsingEncoding:NSUTF8StringEncoding]);
+			os_event_signal(dc->disp_finished);
+		}];
 		os_event_wait(dc->disp_finished);
 	}
 
@@ -100,7 +110,7 @@ static void general_capture_destroy(void *data)
 
 	obs_enter_graphics();
 
-	destroy_display_stream(dc);
+	destroy_general_stream(dc);
 
 	if (dc->sampler)
 		gs_samplerstate_destroy(dc->sampler);
@@ -116,13 +126,17 @@ static void general_capture_destroy(void *data)
 		dc->shareable_content_available = NULL;
 	}
 
+	if (dc->capture_delegate) {
+		[dc->capture_delegate release];
+	}
+
 	destroy_window(&dc->window);
 
 	pthread_mutex_destroy(&dc->mutex);
 	bfree(dc);
 }
 
-static inline void display_stream_update(struct general_capture *dc,
+static inline void general_stream_update(struct general_capture *dc,
 					 CMSampleBufferRef sample_buffer)
 {
 	CVImageBufferRef image_buffer =
@@ -155,7 +169,7 @@ static inline void display_stream_update(struct general_capture *dc,
 	}
 }
 
-static bool init_display_stream(struct general_capture *dc)
+static bool init_general_stream(struct general_capture *dc)
 {
 	SCContentFilter *content_filter;
 
@@ -214,7 +228,7 @@ static bool init_display_stream(struct general_capture *dc)
 	case GeneralCaptureDisplayStream: {
 		content_filter = [[SCContentFilter alloc]
 			 initWithDisplay:target_display
-			excludingWindows:nil];
+			excludingWindows:[[NSArray alloc] init]];
 	} break;
 	case GeneralCaptureWindowStream: {
 		content_filter = [[SCContentFilter alloc]
@@ -224,7 +238,7 @@ static bool init_display_stream(struct general_capture *dc)
 		content_filter = [[SCContentFilter alloc]
 			      initWithDisplay:target_display
 			includingApplications:target_application_array
-			     exceptingWindows:nil];
+			     exceptingWindows:[[NSArray alloc] init]];
 	} break;
 	}
 	os_sem_post(dc->shareable_content_available);
@@ -235,25 +249,39 @@ static bool init_display_stream(struct general_capture *dc)
 	[stream_properties setShowsCursor:!dc->hide_cursor];
 	[stream_properties setPixelFormat:'BGRA'];
 
+	dc->disp = [[SCStream alloc] initWithFilter:content_filter
+				      configuration:stream_properties
+					   delegate:nil];
+
+	NSError *error = nil;
+	BOOL did_add_output = [dc->disp addStreamOutput:dc->capture_delegate
+						   type:SCStreamOutputTypeScreen
+				     sampleHandlerQueue:nil
+						  error:&error];
+	if (!did_add_output) {
+		blog(LOG_ERROR,
+		     "init_general_stream: Failed to add stream output with error %s\n",
+		     [[error localizedFailureReason]
+			     cStringUsingEncoding:NSUTF8StringEncoding]);
+		[error release];
+		return !did_add_output;
+	}
+
 	os_event_init(&dc->disp_finished, OS_EVENT_TYPE_MANUAL);
 	os_event_init(&dc->stream_start_completed, OS_EVENT_TYPE_MANUAL);
 
-	dc->disp = [[SCStream alloc] initWithFilter:content_filter
-			    captureOutputProperties:stream_properties
-					   delegate:nil];
-
 	__block BOOL did_stream_start = false;
-	[dc->disp
-		startCaptureWithFrameHandler:^(
-			SCStream *_Nonnull stream,
-			CMSampleBufferRef _Nonnull sample_buffer) {
-			UNUSED_PARAMETER(stream);
-			display_stream_update(dc, sample_buffer);
+	[dc->disp startCaptureWithCompletionHandler:^(
+			  NSError *_Nullable error) {
+		did_stream_start = (BOOL)(error == nil);
+		if (!did_stream_start) {
+			blog(LOG_ERROR,
+			     "init_general_stream: Failed to add start capture with error %s\n",
+			     [[error localizedFailureReason]
+				     cStringUsingEncoding:NSUTF8StringEncoding]);
 		}
-		completionHandler:^(NSError *_Nullable error) {
-			did_stream_start = (BOOL)(error == nil);
-			os_event_signal(dc->stream_start_completed);
-		}];
+		os_event_signal(dc->stream_start_completed);
+	}];
 	os_event_wait(dc->stream_start_completed);
 
 	return did_stream_start;
@@ -306,10 +334,18 @@ static void *general_capture_create(obs_data_t *settings, obs_source_t *source)
 							 dc->shareable_content =
 								 [shareable_content
 									 retain];
+						 } else {
+							 blog(LOG_ERROR,
+							      "general_capture_create: Failed to get shareable content with error %s\n",
+							      [[error localizedFailureReason]
+								      cStringUsingEncoding:
+									      NSUTF8StringEncoding]);
 						 }
 						 os_sem_post(
 							 dc->shareable_content_available);
 					 }];
+	dc->capture_delegate = [[GeneralCaptureDelegate alloc] init];
+	dc->capture_delegate.dc = dc;
 
 	dc->effect = obs_get_base_effect(OBS_EFFECT_DEFAULT_RECT);
 	if (!dc->effect)
@@ -340,7 +376,7 @@ static void *general_capture_create(obs_data_t *settings, obs_source_t *source)
 						       "application")];
 	pthread_mutex_init(&dc->mutex, NULL);
 
-	if (!init_display_stream(dc))
+	if (!init_general_stream(dc))
 		goto fail;
 
 	return dc;
@@ -528,12 +564,12 @@ static void general_capture_update(void *data, obs_data_t *settings)
 
 	obs_enter_graphics();
 
-	destroy_display_stream(dc);
+	destroy_general_stream(dc);
 	dc->capture_type = capture_type;
 	dc->display = display;
 	dc->application_id = application_id;
 	dc->hide_cursor = !show_cursor;
-	init_display_stream(dc);
+	init_general_stream(dc);
 
 	obs_leave_graphics();
 }
@@ -557,6 +593,12 @@ static obs_properties_t *general_capture_properties(void *data)
 							 dc->shareable_content =
 								 [shareable_content
 									 retain];
+						 } else {
+							 blog(LOG_ERROR,
+							      "general_capture_properties: Failed to get shareable content with error %s\n",
+							      [[error localizedFailureReason]
+								      cStringUsingEncoding:
+									      NSUTF8StringEncoding]);
 						 }
 						 os_sem_post(
 							 dc->shareable_content_available);
@@ -674,6 +716,19 @@ struct obs_source_info general_capture_info = {
 	.update = general_capture_update,
 	.icon_type = OBS_ICON_TYPE_GAME_CAPTURE,
 };
+
+@implementation GeneralCaptureDelegate
+
+- (void)stream:(SCStream *)stream
+	didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+		       ofType:(SCStreamOutputType)type
+{
+	if (self.dc != NULL) {
+		general_stream_update(self.dc, sampleBuffer);
+	}
+}
+
+@end
 
 // "-Wunguarded-availability-new"
 #pragma clang diagnostic pop
